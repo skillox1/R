@@ -1,0 +1,282 @@
+library(skimr)
+library(tidyverse)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(pROC)
+library(tidymodels)
+library(janitor)
+
+
+# Importa e verifica dados tratados no Python
+
+dados <- read.csv("XXXX") %>% 
+  clean_names()
+
+skim(dados)
+
+dados %>% 
+  summary()
+
+
+##### Contrói tabela para comparação dos modelos
+
+tab <- tibble(Método = c("Logit", "Ridge", "Lasso","Árvore","Random Forest"),RMSE = NA, AUC = NA) 
+
+
+
+                         ######## Regressão Logit  #########
+
+
+set.seed(123)
+
+# No conjunto treinamento,considerar como referência os valores apresentados 
+# na coluna "default"
+
+
+splits <- initial_split(dados, prop = .80,
+                        strata = "default")
+
+tr <- training(splits)
+test <- testing(splits)
+
+# Cria objeto fit_log  a partir do conjunto de treinamento tr
+
+
+fit_log <- glm(default ~., family = "binomial", data = tr)
+
+
+summary(fit_log)
+
+
+y_lm <- predict(fit_log, test)
+
+y <- dados[rownames(test),]$Price
+
+tab$RMSE[tab$metodo == "Logit"] <- sqrt(mean((y - y_lm)^2))
+
+## Calcular e popular com dados da curva ROC 
+
+
+tab$AUC[tab$metodo == "Logit"] <- roc(dados$default[rownames(test)], fit_log)$auc
+
+
+
+                      #########    Ridge e Lasso   #########
+
+##Entradas para Glmnet 
+
+
+X <- model.matrix(default ~ ., data = dados) # X deve ser uma matriz
+y <- dados$default
+
+idx <- as.integer(rownames(test))
+
+
+#Ridge -------------------------------------------------------------------
+  
+  
+  
+ridge <- glmnet(X[idx,], y[idx], alpha = 0, nlambda = 500)
+
+plot_glmnet(ridge, lwd = 2, cex.lab = 1.3)
+
+
+#Ridge - Validação cruzada -----------------------------------------------
+  
+  
+cv_ridge <- cv.glmnet(X[idx,], y[idx], alpha = 0)
+
+plot(cv_ridge, cex.lab = 1.3)
+
+y_ridge <- predict(ridge, newx = X[-idx,], s = cv_ridge$lambda.1se) # valor predito
+
+tab$RMSE[tab$metodo == "Ridge"] <- sqrt(mean((y[-idx] - y_ridge)^2))
+
+fit_ridge <- glmnet(X[idx,], y[idx], alpha = 0, lambda = cv_ridge$lambda.1se)
+
+#Lasso ----------------------------------------------------------------
+  
+  
+lasso <- glmnet(X[idx,], y[idx], alpha = 1, nlambda = 1000)
+
+plot_glmnet(lasso, lwd = 2, cex.lab = 1.3, xvar = "lambda")
+
+cv_lasso <- cv.glmnet(X[idx,], y[idx], alpha = 1, lambda = lasso$lambda)
+
+plot(cv_lasso, cex.lab = 1.3)
+
+
+y_lasso <- predict(lasso, newx = X[-idx,], s = cv_lasso$lambda.min)
+
+tab$RMSE[tab$metodo == "Lasso"] <- sqrt(mean((y[-idx] - y_lasso)^2))
+
+fit_lasso <- glmnet(X[idx,], y[idx], alpha = 1, lambda = cv_lasso$lambda.min)
+
+
+### Árvore de Decisão 
+
+
+set.seed(123)
+
+splits <- initial_split(dados, prop = .80)
+
+treino <- training(splits)
+
+teste <- testing(splits)
+
+fit <- rpart(Price ~ ., treino)
+
+rpart.plot(fit)
+
+tab$RMSE[tab$metodo == "Árvore"] <- sqrt(mean((predict(fit, teste) - teste$Price)^2))
+
+#### Avaliação de parâmetros árvore
+
+arvore <- rpart(y ~ x, dados)
+
+arvore
+
+rpart.plot(arvore)
+
+(plot_arvore <- as.party(arvore))
+
+plot(plot_arvore)
+
+arvore <- rpart(y ~ x, dados, 
+                control = rpart.control(minsplit = 40, minbucket = 20, cp = 0))
+
+rpart.plot(arvore)
+
+arvore$cptable
+
+
+##Parâmetro com controles
+
+set.seed(202)
+arvore <- Credit[idx,] %>% 
+  select(-ID) %>% 
+  rpart(Balance ~., data = ., control = rpart.control(xval = 10, cp = 0))
+
+plotcp(arvore)
+
+# Árvore com parãmetros (control)
+
+set.seed(21)
+
+idx <- sample(nrow(Credit), size = 0.8 * nrow(Credit), replace = FALSE)
+
+arvore <- Credit[idx,] %>%
+  select(-ID) %>%
+  rpart(Balance ~ ., data = ., model = TRUE, control = rpart.control(xval = 10, cp = 0))
+
+rpart.plot(arvore)
+plotcp(arvore)
+
+## Visualmente uma quantidade de 12 nós terminais parece oferecer o melhor custo benefício
+
+## Avaliação e plot da árvore podada
+
+
+cp_ot <- arvore$cptable[which.min(arvore$cptable[,"xerror"]),"CP"]
+
+cp_ot <- arvore$cptable %>%
+  as_tibble() %>%
+  filter(xerror == min(xerror))
+
+# OU std
+
+corte <- arvore$cptable %>%
+  as_tibble() %>%
+  filter(xerror == min(xerror)) %>%
+  transmute(corte = xerror + xstd)
+
+cp_ot <- arvore$cptable %>%
+  as_tibble() %>%
+  filter(xerror <= corte[[1]])
+
+# Gráfico da árvore após a poda a partir da validação cruzada
+
+poda1 <- prune(arvore, cp = cp_ot$CP[1])
+rpart.plot(poda1, roundint = FALSE)
+
+# Gráfico com parâmetro default da função
+
+poda1 <- prune(arvore, cp = 0)
+rpart.plot(poda1, roundint = FALSE)
+
+# Comparação do Modelo Linear com a Árvore Podada #
+
+
+# Gráfico predito x observado
+
+tibble(y_obs = Credit$Balance[-idx],
+       y_pred = predict(poda1, newdata = Credit[-idx,])) %>%
+  ggplot(aes(y_obs, y_pred)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", size = 2) +
+  geom_point(size = 3, alpha = .5)
+
+
+vip::vip(poda1, aesthetics = list(fill = "darkblue")) +
+  theme_bw()
+
+
+
+
+
+
+
+## Random Forest 
+
+
+rf <- ranger(Price ~ ., treino)
+
+tab$RMSE[tab$metodo == "Random Forest"] <- sqrt(mean((predict(rf, teste)$predictions - teste$Price)^2))
+
+
+
+
+#### Avaliação de parâmetros Random Forest
+
+
+
+## Código com Crossing em Mtry
+
+#set.seed(123)
+#(rf <- ranger(Price ~ ., data = dados))
+
+
+#resultados <- crossing(mtry = c(2, 4, 8, 15), 
+#                       n_arvores = c(1:10, seq(10, 500, 10)))
+#ajusta <- function(mtry, n_arvores) {
+#  rf <- ranger(Price ~ ., num.trees = n_arvores, mtry = mtry, data = dados)
+#  return(rf$prediction.error)
+#}
+
+#resultados <- resultados %>% 
+#  mutate(mse = map2_dbl(mtry, n_arvores, ajusta))
+#head(resultados)
+
+#resultados %>%  
+#  mutate(mtry = factor(mtry)) %>% 
+#  ggplot(aes(n_arvores, mse, group = mtry, color = mtry)) + 
+#  geom_line( size = 1.2) + 
+#  labs(x = "Número de Árvores", y = "MSE (OOB)") + 
+#  theme_bw()
+
+
+
+## Vip - Importância das variáveis
+
+rf1 <- ranger(Price ~ ., importance = "impurity", data = dados)
+vip::vip(rf1, aesthetics = list(fill = "#FF5757")) 
+
+View(tab)
+head(fit)
+
+
+
+
+
+
